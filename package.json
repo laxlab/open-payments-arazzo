@@ -1,0 +1,13 @@
+{
+  "name": "open-payments-arazzo",
+  "version": "1.0.0",
+  "description": "Arazzo Specification workflows documenting Open Payments API flows",
+  "private": true,
+  "scripts": {
+    "validate": "redocly lint workflows/",
+    "validate:one": "redocly lint"
+  },
+  "devDependencies": {
+    "@redocly/cli": "^1.25.0"
+  }
+}
