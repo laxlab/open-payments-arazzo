@@ -1,0 +1,197 @@
+arazzo: 1.0.1
+
+info:
+  title: Create an Incoming Payment
+  version: 1.0.0
+  description: |-
+    Documents the three-step sequence required to create an incoming payment
+    resource on a payee's Open Payments-enabled wallet.
+
+    An incoming payment must exist before any funds can move. The receiving
+    Account Servicing Entity (ASE) uses it to generate unique payment details,
+    track received funds, and optionally cap the total receivable amount.
+
+    This workflow uses a non-interactive GNAP grant — the authorization server
+    issues an access token immediately without requiring the account holder to
+    approve anything in a browser. Non-interactive grants are appropriate here
+    because creating an incoming payment does not require the payee's real-time
+    consent.
+
+    The incoming payment URL produced by this workflow is the input the payer
+    needs to begin the quote flow.
+
+sourceDescriptions:
+  - name: wallet-address-server
+    url: ../specs/wallet-address-server.yaml
+    type: openapi
+  - name: auth-server
+    url: ../specs/auth-server.yaml
+    type: openapi
+  - name: resource-server
+    url: ../specs/resource-server.yaml
+    type: openapi
+
+workflows:
+  - workflowId: create-incoming-payment
+    summary: Create an incoming payment on the payee's wallet
+    description: |-
+      Resolves the payee's wallet address to discover server endpoints, obtains
+      a non-interactive GNAP grant scoped to incoming-payment creation, then
+      creates the incoming payment resource on the payee's resource server.
+
+    inputs:
+      type: object
+      required:
+        - payeeWalletAddress
+        - clientWalletAddress
+      properties:
+        payeeWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the payment recipient. This URL doubles
+            as the service endpoint for the Wallet Address Server — step 1
+            makes a GET request directly to this URL.
+          example: https://ilp.interledger-test.dev/bob
+        clientWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the client initiating this workflow. Sent
+            as the client identifier in the GNAP grant request so the
+            authorization server can resolve and verify the client's public
+            keys via the client's own wallet address server.
+          example: https://ilp.interledger-test.dev/alice
+        incomingAmount:
+          type: object
+          description: |-
+            Optional. The maximum amount that can be paid into this incoming
+            payment. Once the total received equals or exceeds this value, the
+            ASE rejects further payments and marks the resource as completed.
+            Omit to create an open-ended incoming payment with no upper limit.
+          properties:
+            value:
+              type: string
+              description: Amount as an unsigned 64-bit integer string.
+              example: '2500'
+            assetCode:
+              type: string
+              description: ISO 4217 currency code.
+              example: USD
+            assetScale:
+              type: integer
+              description: |-
+                Number of decimal places. A value of 2500 with assetScale 2
+                represents 25.00 USD.
+              example: 2
+        expiresAt:
+          type: string
+          format: date-time
+          description: |-
+            Optional. ISO 8601 datetime after which the incoming payment stops
+            accepting funds. The ASE rejects any payment arriving after this
+            timestamp.
+          example: '2024-12-31T23:59:59Z'
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |-
+            Optional. Arbitrary key-value pairs stored on the resource. Use
+            this to attach an external reference for reconciliation such as an
+            invoice number from your own system.
+          example:
+            externalRef: INV-2024-001
+
+    steps:
+      - stepId: get-wallet-address
+        description: |-
+          Calls the Wallet Address Server at the payee's wallet address URL to
+          retrieve public account details. The response contains two fields
+          this workflow depends on: authServer, which is where we request a
+          grant in step 2, and resourceServer, which is where we create the
+          incoming payment in step 3.
+
+          This endpoint requires no authentication and is intentionally open
+          to anonymous requests. Its purpose is to let any client discover a
+          wallet's server endpoints before beginning a payment flow.
+        operationId: wallet-address-server.get-wallet-address
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          authServer: $response.body#/authServer
+          resourceServer: $response.body#/resourceServer
+
+      - stepId: request-grant
+        description: |-
+          Sends a GNAP grant request to the authorization server URL discovered
+          in step 1. The request body identifies the client by wallet address
+          URL and declares the access being requested: the incoming-payment
+          resource type, scoped to create and read actions on the payee's
+          specific wallet address.
+
+          Because no interact field is included, this is a non-interactive grant
+          request. The authorization server responds immediately with an
+          access_token if the client is recognized and the access is permitted.
+
+          All requests to the authorization server must carry a valid HTTP
+          Message Signature (RFC 9421) proving the request originated from the
+          declared client. The Arazzo runtime or SDK is responsible for
+          generating this signature before the request is sent.
+        operationId: auth-server.post-request
+        requestBody:
+          contentType: application/json
+          payload:
+            client: $inputs.clientWalletAddress
+            access_token:
+              access:
+                - type: incoming-payment
+                  actions:
+                    - create
+                    - read
+                  identifier: $inputs.payeeWalletAddress
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          accessToken: $response.body#/access_token/value
+          continueUri: $response.body#/continue/uri
+
+      - stepId: create-incoming-payment
+        description: |-
+          Creates the incoming payment resource on the payee's resource server
+          using the access token from step 2.
+
+          The walletAddress field in the request body identifies which wallet
+          this incoming payment belongs to. The incomingAmount, expiresAt, and
+          metadata fields are all optional and passed through from this
+          workflow's inputs unchanged.
+
+          On success the resource server generates unique ILP payment details
+          and attaches them to the resource under the methods field. Any ILP
+          packet sent to those details is automatically associated with this
+          incoming payment and counted toward receivedAmount.
+
+          The id field in the response is the incoming payment URL. This is
+          the value the payer's client needs to create a quote in the next
+          workflow.
+        operationId: resource-server.create-incoming-payment
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+        requestBody:
+          contentType: application/json
+          payload:
+            walletAddress: $inputs.payeeWalletAddress
+            incomingAmount: $inputs.incomingAmount
+            expiresAt: $inputs.expiresAt
+            metadata: $inputs.metadata
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          incomingPaymentUrl: $response.body#/id
+          walletAddress: $response.body#/walletAddress
+          completed: $response.body#/completed
+          createdAt: $response.body#/createdAt
+
+    outputs:
+      incomingPaymentUrl: $steps.create-incoming-payment.outputs.incomingPaymentUrl
