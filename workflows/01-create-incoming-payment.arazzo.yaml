@@ -2,6 +2,7 @@ arazzo: 1.0.1
 
 info:
   title: Create an Incoming Payment
+  summary: Three-step workflow to create an incoming payment resource on a payee wallet
   version: 1.0.0
   description: |-
     Documents the three-step sequence required to create an incoming payment

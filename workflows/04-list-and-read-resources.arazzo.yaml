@@ -2,6 +2,7 @@ arazzo: 1.0.1
 
 info:
   title: List and Read Resources
+  summary: Seven-step workflow for listing and reading incoming payments, outgoing payments, and quotes
   version: 1.0.0
   description: |-
     Documents the seven-step sequence for listing and reading Open Payments

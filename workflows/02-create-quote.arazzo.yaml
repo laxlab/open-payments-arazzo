@@ -2,6 +2,7 @@ arazzo: 1.0.1
 
 info:
   title: Create a Quote
+  summary: Three-step workflow to create a quote resource on the payer wallet
   version: 1.0.0
   description: |-
     Documents the three-step sequence required to create a quote resource on
