@@ -1,0 +1,196 @@
+arazzo: 1.0.1
+
+info:
+  title: Complete an Incoming Payment
+  summary: Three-step workflow to explicitly mark an incoming payment as complete
+  version: 1.0.0
+  description: |-
+    Documents the three-step sequence required to explicitly mark an incoming
+    payment resource as complete on a payee's Open Payments-enabled wallet.
+
+    This workflow is necessary in two scenarios. The first is a fixed-send
+    payment — where the payer controls the debit amount rather than specifying
+    a receive amount on the incoming payment. Because no incomingAmount cap was
+    set when the incoming payment was created, the payee's ASE has no automatic
+    trigger to mark the resource complete. The client must call this endpoint
+    explicitly once the outgoing payment has finished executing.
+
+    The second scenario is streaming Web Monetization. Payments stream
+    continuously until the Web Monetization agent ends the session. At that
+    point the agent calls this endpoint to signal to the payee's ASE that no
+    further funds are coming, allowing the ASE to immediately begin any post
+    payment processing such as generating account statements or crediting the
+    payee's account balance, rather than waiting for the incoming payment to
+    expire.
+
+    Calling this endpoint does not require the full incomingAmount to have been
+    received. A client can mark an incoming payment complete even if only a
+    partial amount arrived. The completed flag simply signals that the client
+    will not send any further payments toward this resource.
+
+    This endpoint accepts no request body. The only inputs required are the
+    identity of the incoming payment to complete and the credentials to
+    authorize the operation.
+
+sourceDescriptions:
+  - name: wallet-address-server
+    url: ../specs/wallet-address-server.yaml
+    type: openapi
+  - name: auth-server
+    url: ../specs/auth-server.yaml
+    type: openapi
+  - name: resource-server
+    url: ../specs/resource-server.yaml
+    type: openapi
+
+workflows:
+  - workflowId: complete-incoming-payment
+    summary: Mark an incoming payment as complete on the payee's wallet
+    description: |-
+      Resolves the payee's wallet address to discover server endpoints, obtains
+      a non-interactive GNAP grant with complete and read access on the incoming
+      payment resource, then posts to the complete endpoint to mark the incoming
+      payment as finished.
+
+    inputs:
+      type: object
+      required:
+        - walletAddress
+        - clientWalletAddress
+        - incomingPaymentId
+      properties:
+        walletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the payee whose incoming payment is being
+            completed. Used in step 1 to discover the authorization and resource
+            server endpoints, and used as the identifier in the grant access
+            object in step 2 to scope the grant to this specific wallet.
+          example: https://ilp.interledger-test.dev/bob
+        clientWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the client making this request. Sent as
+            the client identifier in the GNAP grant request so the authorization
+            server can resolve and verify the client's public keys.
+          example: https://ilp.interledger-test.dev/alice
+        incomingPaymentId:
+          type: string
+          description: |-
+            The UUID of the incoming payment resource to complete. This is the
+            last path segment of the incoming payment URL — for example, if the
+            incoming payment URL is
+            https://ilp.interledger-test.dev/incoming-payments/016da9d5-c9a4-4c80-a354-86b915a04ff8
+            then incomingPaymentId is
+            016da9d5-c9a4-4c80-a354-86b915a04ff8.
+
+            Arazzo 1.0.1 runtime expressions cannot extract a path segment from
+            a full URL string, so the client implementation is responsible for
+            parsing the incoming payment URL and supplying only the UUID here.
+            The incoming payment URL is available as the incomingPaymentUrl
+            output from the create-incoming-payment workflow.
+          example: 016da9d5-c9a4-4c80-a354-86b915a04ff8
+
+    steps:
+      - stepId: get-wallet-address
+        description: |-
+          Calls the Wallet Address Server at the payee's wallet address URL to
+          retrieve the payee's public account details. The authServer field in
+          the response is where step 2 sends the grant request. The
+          resourceServer field is where step 3 posts the complete request.
+
+          This endpoint requires no authentication and is open to anonymous
+          requests by design.
+        operationId: wallet-address-server.get-wallet-address
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          authServer: $response.body#/authServer
+          resourceServer: $response.body#/resourceServer
+
+      - stepId: request-grant
+        description: |-
+          Sends a non-interactive GNAP grant request to the payee's
+          authorization server asking for permission to complete and read
+          incoming payment resources on the payee's wallet.
+
+          The complete action is what authorizes the client to call the
+          /incoming-payments/{id}/complete endpoint in step 3. Without it the
+          resource server returns a 403. The read action is included so the
+          client can fetch the final state of the incoming payment after
+          completion if needed.
+
+          The identifier field scopes this grant to the specific payee wallet
+          address. The grant cannot be used to complete incoming payments on
+          any other wallet.
+
+          This is a non-interactive grant — no interact block is included. The
+          authorization server issues an access token immediately. Completing
+          an incoming payment does not debit any funds from any account, so
+          real-time consent from the account holder is not required.
+
+          All requests to the authorization server must carry a valid HTTP
+          Message Signature (RFC 9421).
+        operationId: auth-server.post-request
+        requestBody:
+          contentType: application/json
+          payload:
+            client: $inputs.clientWalletAddress
+            access_token:
+              access:
+                - type: incoming-payment
+                  actions:
+                    - complete
+                    - read
+                  identifier: $inputs.walletAddress
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          accessToken: $response.body#/access_token/value
+
+      - stepId: complete-incoming-payment
+        description: |-
+          Posts to the complete endpoint on the payee's resource server to
+          mark the incoming payment as finished. This endpoint accepts no
+          request body — the only inputs are the incoming payment UUID in the
+          path and the access token in the Authorization header.
+
+          On success the resource server sets completed to true on the resource
+          and returns the full incoming payment object reflecting the final
+          state. The receivedAmount field shows the total amount that was
+          received before completion. This is the canonical record of how much
+          actually arrived regardless of what incomingAmount was originally
+          requested.
+
+          The payee's ASE treats this response as the signal to begin any post
+          payment processing. In practice this means crediting the payee's
+          account balance for the receivedAmount and triggering any configured
+          notifications or reconciliation workflows on the ASE side.
+
+          The id path parameter is the incomingPaymentId workflow input — the
+          UUID segment extracted from the full incoming payment URL. The same
+          parsing requirement applies here as in the list-and-read-resources
+          workflow.
+        operationId: resource-server.complete-incoming-payment
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: id
+            in: path
+            value: $inputs.incomingPaymentId
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          incomingPaymentUrl: $response.body#/id
+          walletAddress: $response.body#/walletAddress
+          completed: $response.body#/completed
+          receivedAmount: $response.body#/receivedAmount
+          createdAt: $response.body#/createdAt
+
+    outputs:
+      incomingPaymentUrl: $steps.complete-incoming-payment.outputs.incomingPaymentUrl
+      completed: $steps.complete-incoming-payment.outputs.completed
+      receivedAmount: $steps.complete-incoming-payment.outputs.receivedAmount
