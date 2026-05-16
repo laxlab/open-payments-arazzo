@@ -4,7 +4,7 @@
   "description": "Arazzo Specification workflows documenting Open Payments API flows",
   "private": true,
   "scripts": {
-    "validate": "redocly lint workflows/",
+    "validate": "redocly lint workflows/01-create-incoming-payment.arazzo.yaml workflows/02-create-quote.arazzo.yaml workflows/03-end-to-end-payment.arazzo.yaml workflows/04-list-and-read-resources.arazzo.yaml workflows/05-complete-incoming-payment.arazzo.yaml",
     "validate:one": "redocly lint"
   },
   "devDependencies": {
