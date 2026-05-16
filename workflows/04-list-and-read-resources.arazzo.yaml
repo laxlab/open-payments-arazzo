@@ -1,0 +1,392 @@
+arazzo: 1.0.1
+
+info:
+  title: List and Read Resources
+  version: 1.0.0
+  description: |-
+    Documents the seven-step sequence for listing and reading Open Payments
+    resources on a wallet address.
+
+    This workflow covers the read side of the Open Payments Resource Server
+    API — listing paginated collections of incoming payments and outgoing
+    payments, and fetching individual incoming payment, outgoing payment, and
+    quote resources by their identifier.
+
+    All operations in this workflow are read-only. No resources are created
+    and no funds move. A single non-interactive GNAP grant covers all seven
+    steps by requesting list and read access across all three resource types
+    in one grant request.
+
+    This workflow is useful for building transaction history views, account
+    dashboards, reconciliation tools, and anything else that needs to inspect
+    existing resources without creating new ones.
+
+    The get-quote step in this workflow is the canonical location for
+    standalone quote reads. Creating a quote and immediately reading it back
+    is unnecessary since the create-quote response already returns the full
+    quote object — but fetching a quote by ID later, for example to check
+    whether it has expired, is a legitimate standalone operation documented
+    here.
+
+sourceDescriptions:
+  - name: wallet-address-server
+    url: ../specs/wallet-address-server.yaml
+    type: openapi
+  - name: auth-server
+    url: ../specs/auth-server.yaml
+    type: openapi
+  - name: resource-server
+    url: ../specs/resource-server.yaml
+    type: openapi
+
+workflows:
+  - workflowId: list-and-read-resources
+    summary: List and read incoming payments, outgoing payments, and quotes
+    description: |-
+      Resolves the wallet address to discover server endpoints, obtains a
+      non-interactive GNAP grant with list and read access across all three
+      resource types, then lists and reads incoming payments, outgoing
+      payments, and a quote.
+
+    inputs:
+      type: object
+      required:
+        - walletAddress
+        - clientWalletAddress
+        - incomingPaymentId
+        - outgoingPaymentId
+        - quoteId
+      properties:
+        walletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL whose resources this workflow reads. Used
+            in step 1 to discover server endpoints, and passed as the
+            wallet-address query parameter in the list operations in steps 3
+            and 5 to filter results to this specific account.
+          example: https://ilp.interledger-test.dev/alice
+        clientWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the client making this request. Sent as
+            the client identifier in the GNAP grant request so the
+            authorization server can resolve and verify the client's public
+            keys.
+          example: https://ilp.interledger-test.dev/alice
+        incomingPaymentId:
+          type: string
+          description: |-
+            The UUID of the incoming payment resource to fetch in step 4. This
+            is the last path segment of the incoming payment URL — for example,
+            if the incoming payment URL is
+            https://ilp.interledger-test.dev/incoming-payments/08394f02-7b7b-45e2-b645-51d04e7c330c
+            then incomingPaymentId is
+            08394f02-7b7b-45e2-b645-51d04e7c330c.
+
+            Arazzo 1.0.1 runtime expressions cannot extract a path segment from
+            a full URL string, so the client implementation is responsible for
+            parsing the incoming payment URL and supplying only the UUID here.
+          example: 08394f02-7b7b-45e2-b645-51d04e7c330c
+        outgoingPaymentId:
+          type: string
+          description: |-
+            The UUID of the outgoing payment resource to fetch in step 6. This
+            is the last path segment of the outgoing payment URL — for example,
+            if the outgoing payment URL is
+            https://ilp.interledger-test.dev/outgoing-payments/8c68d3cc-0a0f-4216-98b4-4fa44a6c88cf
+            then outgoingPaymentId is
+            8c68d3cc-0a0f-4216-98b4-4fa44a6c88cf.
+
+            Same parsing requirement as incomingPaymentId above.
+          example: 8c68d3cc-0a0f-4216-98b4-4fa44a6c88cf
+        quoteId:
+          type: string
+          description: |-
+            The UUID of the quote resource to fetch in step 7. This is the
+            last path segment of the quote URL — for example, if the quote URL
+            is
+            https://ilp.interledger-test.dev/quotes/3859b39e-4666-4ce5-8745-72f1864c5371
+            then quoteId is
+            3859b39e-4666-4ce5-8745-72f1864c5371.
+
+            Same parsing requirement as incomingPaymentId above. The quoteId
+            produced by the create-quote workflow can be used here after
+            extracting the UUID segment from the full quote URL.
+          example: 3859b39e-4666-4ce5-8745-72f1864c5371
+        first:
+          type: integer
+          description: |-
+            Optional. The maximum number of resources to return per page when
+            listing incoming payments in step 3 and outgoing payments in step 5.
+            Use this for forward pagination — the response includes a
+            pagination.endCursor value that can be used as the cursor input for
+            the next page request.
+          example: 10
+        last:
+          type: integer
+          description: |-
+            Optional. The maximum number of resources to return per page when
+            listing in reverse order. Use this for backward pagination — the
+            response includes a pagination.startCursor value that can be used
+            as the cursor input for the previous page request. Mutually
+            exclusive with first.
+          example: 10
+        cursor:
+          type: string
+          description: |-
+            Optional. The pagination cursor from a previous list response.
+            Supply pagination.endCursor here to fetch the next page forward,
+            or pagination.startCursor to fetch the previous page backward.
+          example: 241de237-f989-42be-926d-c0c1fca57708
+
+    steps:
+      - stepId: get-wallet-address
+        description: |-
+          Calls the Wallet Address Server at the wallet address URL to retrieve
+          public account details. The authServer field in the response is where
+          step 2 requests the grant. The resourceServer field is where steps 3
+          through 7 send their read requests.
+
+          This endpoint requires no authentication. It is open to anonymous
+          requests by design so any client can discover a wallet's server
+          endpoints before beginning any operation.
+        operationId: wallet-address-server.get-wallet-address
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          authServer: $response.body#/authServer
+          resourceServer: $response.body#/resourceServer
+
+      - stepId: request-grant
+        description: |-
+          Sends a non-interactive GNAP grant request to the authorization
+          server asking for list and read access across all three resource
+          types: incoming-payment, outgoing-payment, and quote.
+
+          Combining all three resource types into a single grant request is
+          correct GNAP behaviour — a client can request access to multiple
+          resource types in one access_token object, and the authorization
+          server issues a single access token that covers all of them. This
+          avoids making three separate round trips to the authorization server
+          for what is conceptually a single read session.
+
+          The grant is non-interactive. No interact block is included, so the
+          authorization server issues the access token immediately. Read-only
+          access to existing resources does not require the account holder's
+          real-time consent.
+
+          The identifier field scopes the incoming-payment and outgoing-payment
+          access to the specific wallet address. Quote access is not scoped to
+          an identifier because quotes are not account-level financial
+          resources.
+
+          All requests to the authorization server must carry a valid HTTP
+          Message Signature (RFC 9421).
+        operationId: auth-server.post-request
+        requestBody:
+          contentType: application/json
+          payload:
+            client: $inputs.clientWalletAddress
+            access_token:
+              access:
+                - type: incoming-payment
+                  actions:
+                    - list
+                    - read
+                  identifier: $inputs.walletAddress
+                - type: outgoing-payment
+                  actions:
+                    - list
+                    - read
+                  identifier: $inputs.walletAddress
+                - type: quote
+                  actions:
+                    - read
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          accessToken: $response.body#/access_token/value
+
+      - stepId: list-incoming-payments
+        description: |-
+          Fetches a paginated list of incoming payment resources on the wallet
+          address. The wallet-address query parameter filters the results to
+          the specific account. The first, last, and cursor parameters control
+          pagination.
+
+          The response contains a result array of incoming payment objects and
+          a pagination object with cursor values for navigating to adjacent
+          pages. The hasPreviousPage and hasNextPage fields indicate whether
+          additional pages exist in each direction.
+
+          To fetch the next page forward, make a second request with cursor set
+          to the pagination.endCursor value from this response and first set to
+          the desired page size. To fetch the previous page, use
+          pagination.startCursor with last instead.
+        operationId: resource-server.list-incoming-payments
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: wallet-address
+            in: query
+            value: $inputs.walletAddress
+          - name: first
+            in: query
+            value: $inputs.first
+          - name: last
+            in: query
+            value: $inputs.last
+          - name: cursor
+            in: query
+            value: $inputs.cursor
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          incomingPayments: $response.body#/result
+          pagination: $response.body#/pagination
+
+      - stepId: get-incoming-payment
+        description: |-
+          Fetches a single incoming payment resource by its UUID. This returns
+          the full incoming payment object including the current receivedAmount,
+          the completed flag, and the payment methods (ILP address and shared
+          secret) if the resource is still accepting payments.
+
+          The id path parameter is the incomingPaymentId workflow input — the
+          UUID segment extracted from the full incoming payment URL. Arazzo
+          1.0.1 runtime expressions cannot split a URL string and extract a
+          path segment, so the client implementation must parse the full
+          incoming payment URL and supply only the UUID portion here.
+
+          Use this operation to check the current state of an incoming payment:
+          how much has been received so far, whether it is completed, and
+          whether it has expired.
+        operationId: resource-server.get-incoming-payment
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: id
+            in: path
+            value: $inputs.incomingPaymentId
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          incomingPayment: $response.body
+          receivedAmount: $response.body#/receivedAmount
+          completed: $response.body#/completed
+
+      - stepId: list-outgoing-payments
+        description: |-
+          Fetches a paginated list of outgoing payment resources on the wallet
+          address. The response structure mirrors that of list-incoming-payments
+          — a result array and a pagination object with cursor-based navigation.
+
+          Each outgoing payment object in the result array includes the receiver
+          (the incoming payment URL it targeted), debitAmount, receiveAmount,
+          sentAmount (what has actually been sent so far), failed status, and
+          metadata. The sentAmount is particularly useful for monitoring
+          in-flight payments.
+
+          Pagination works identically to list-incoming-payments. Use first and
+          pagination.endCursor to page forward, or last and
+          pagination.startCursor to page backward.
+        operationId: resource-server.list-outgoing-payments
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: wallet-address
+            in: query
+            value: $inputs.walletAddress
+          - name: first
+            in: query
+            value: $inputs.first
+          - name: last
+            in: query
+            value: $inputs.last
+          - name: cursor
+            in: query
+            value: $inputs.cursor
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          outgoingPayments: $response.body#/result
+          pagination: $response.body#/pagination
+
+      - stepId: get-outgoing-payment
+        description: |-
+          Fetches a single outgoing payment resource by its UUID. Returns the
+          full outgoing payment object including the current sentAmount, the
+          failed flag, and the grant spend tracking fields grantSpentDebitAmount
+          and grantSpentReceiveAmount.
+
+          The id path parameter is the outgoingPaymentId workflow input — the
+          UUID segment extracted from the full outgoing payment URL. Same
+          parsing requirement as get-incoming-payment above.
+
+          The failed field starts as false when the outgoing payment is created.
+          If the payer's ASE cannot deliver the payment asynchronously it sets
+          failed to true on the resource. Polling this endpoint after creating
+          an outgoing payment is the standard way to check whether execution
+          succeeded.
+        operationId: resource-server.get-outgoing-payment
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: id
+            in: path
+            value: $inputs.outgoingPaymentId
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          outgoingPayment: $response.body
+          sentAmount: $response.body#/sentAmount
+          failed: $response.body#/failed
+
+      - stepId: get-quote
+        description: |-
+          Fetches a single quote resource by its UUID. Returns the full quote
+          object including debitAmount, receiveAmount, method, and expiresAt.
+
+          The id path parameter is the quoteId workflow input — the UUID
+          segment extracted from the full quote URL. Same parsing requirement
+          as the other single-resource GET steps above.
+
+          The primary use case for this operation is checking whether a quote
+          has expired before attempting to create an outgoing payment against
+          it. If expiresAt is in the past, the client must return to the
+          create-quote workflow to obtain a fresh price commitment before
+          proceeding.
+
+          Note: the create-quote response already returns the complete quote
+          object, so fetching a quote immediately after creating it is
+          unnecessary. This operation is useful when time has passed between
+          quote creation and outgoing payment creation, and the client needs
+          to verify the quote is still valid.
+        operationId: resource-server.get-quote
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+          - name: id
+            in: path
+            value: $inputs.quoteId
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          quote: $response.body
+          expiresAt: $response.body#/expiresAt
+          debitAmount: $response.body#/debitAmount
+          receiveAmount: $response.body#/receiveAmount
+
+    outputs:
+      incomingPayments: $steps.list-incoming-payments.outputs.incomingPayments
+      outgoingPayments: $steps.list-outgoing-payments.outputs.outgoingPayments
+      incomingPayment: $steps.get-incoming-payment.outputs.incomingPayment
+      outgoingPayment: $steps.get-outgoing-payment.outputs.outgoingPayment
+      quote: $steps.get-quote.outputs.quote
