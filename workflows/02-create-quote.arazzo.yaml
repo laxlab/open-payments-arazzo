@@ -1,0 +1,238 @@
+arazzo: 1.0.1
+
+info:
+  title: Create a Quote
+  version: 1.0.0
+  description: |-
+    Documents the three-step sequence required to create a quote resource on
+    a payer's Open Payments-enabled wallet.
+
+    A quote is a formal commitment from the payer's Account Servicing Entity
+    (ASE) to deliver a specific amount to the receiver when a payment is sent
+    right now. It locks in the ILP exchange rate and path for a short window —
+    typically minutes — before expiring. No funds move during this workflow.
+
+    This workflow runs entirely on the payer's side. The receiver (incoming
+    payment URL) produced by Flow 1 is a required input here, which is what
+    connects the two workflows together.
+
+    The quote supports three modes depending on which amount field is provided
+    in the inputs. If the receiver is an incoming payment that already carries
+    an incomingAmount, neither debitAmount nor receiveAmount is needed and the
+    ASE derives the amounts automatically. If debitAmount is provided the quote
+    fixes what leaves the payer's wallet. If receiveAmount is provided the
+    quote fixes what arrives at the payee's wallet. Exactly one of these three
+    modes must apply — providing both debitAmount and receiveAmount is invalid.
+
+    The quoteId produced by this workflow is required input for Flow 3, where
+    it is used to create the outgoing payment that actually moves funds.
+
+sourceDescriptions:
+  - name: wallet-address-server
+    url: ../specs/wallet-address-server.yaml
+    type: openapi
+  - name: auth-server
+    url: ../specs/auth-server.yaml
+    type: openapi
+  - name: resource-server
+    url: ../specs/resource-server.yaml
+    type: openapi
+
+workflows:
+  - workflowId: create-quote
+    summary: Create a quote on the payer's wallet
+    description: |-
+      Resolves the payer's wallet address to discover server endpoints, obtains
+      a non-interactive GNAP grant scoped to quote creation, then creates the
+      quote resource on the payer's resource server.
+
+      Unlike incoming-payment and outgoing-payment grants, quote grant access
+      is not scoped to a specific wallet address identifier. The access object
+      carries only the resource type and permitted actions.
+
+    inputs:
+      type: object
+      required:
+        - payerWalletAddress
+        - clientWalletAddress
+        - incomingPaymentUrl
+      properties:
+        payerWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the payer. Used in step 1 to discover the
+            payer's authorization and resource server endpoints, and included in
+            the quote request body as the walletAddress field to identify which
+            account the quote is created against.
+          example: https://ilp.interledger-test.dev/alice
+        clientWalletAddress:
+          type: string
+          format: uri
+          description: |-
+            The wallet address URL of the client making this request. Sent as
+            the client identifier in the GNAP grant request so the authorization
+            server can resolve and verify the client's public keys.
+          example: https://ilp.interledger-test.dev/alice
+        incomingPaymentUrl:
+          type: string
+          format: uri
+          description: |-
+            The URL of the incoming payment resource created in Flow 1. This is
+            the receiver field in the quote request — it tells the payer's ASE
+            where the funds should ultimately be delivered so it can calculate
+            the ILP path and exchange rate.
+          example: https://ilp.interledger-test.dev/incoming-payments/08394f02-7b7b-45e2-b645-51d04e7c330c
+        debitAmount:
+          type: object
+          description: |-
+            Optional. Provide this to create a fixed-send quote — the payer's
+            ASE will calculate exactly how much arrives at the payee given this
+            exact debit from the payer's wallet. Use this when the payer wants
+            to control precisely how much they spend.
+
+            Must use the same assetCode and assetScale as the payer's wallet
+            address. Cannot be provided alongside receiveAmount.
+          properties:
+            value:
+              type: string
+              description: Amount as an unsigned 64-bit integer string.
+              example: '2500'
+            assetCode:
+              type: string
+              description: ISO 4217 currency code.
+              example: USD
+            assetScale:
+              type: integer
+              description: |-
+                Number of decimal places. A value of 2500 with assetScale 2
+                represents 25.00 USD.
+              example: 2
+        receiveAmount:
+          type: object
+          description: |-
+            Optional. Provide this to create a fixed-receive quote — the
+            payer's ASE will calculate exactly how much must leave the payer's
+            wallet so that this exact amount arrives at the payee. Use this
+            when the payee needs to receive a precise amount.
+
+            Must use the same assetCode and assetScale as the payee's wallet
+            address. Cannot be provided alongside debitAmount.
+          properties:
+            value:
+              type: string
+              description: Amount as an unsigned 64-bit integer string.
+              example: '2198'
+            assetCode:
+              type: string
+              description: ISO 4217 currency code.
+              example: EUR
+            assetScale:
+              type: integer
+              description: |-
+                Number of decimal places. A value of 2198 with assetScale 2
+                represents 21.98 EUR.
+              example: 2
+
+    steps:
+      - stepId: get-wallet-address
+        description: |-
+          Calls the Wallet Address Server at the payer's wallet address URL to
+          retrieve the payer's public account details. The two fields extracted
+          from the response are authServer, used in step 2 to request the quote
+          grant, and resourceServer, used in step 3 to create the quote.
+
+          This is identical in structure to step 1 of Flow 1, except here we
+          call the payer's wallet address rather than the payee's. The endpoint
+          requires no authentication.
+        operationId: wallet-address-server.get-wallet-address
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          authServer: $response.body#/authServer
+          resourceServer: $response.body#/resourceServer
+
+      - stepId: request-grant
+        description: |-
+          Sends a GNAP grant request to the payer's authorization server to
+          obtain permission to create and read quote resources.
+
+          The access object for a quote grant carries only the resource type
+          and actions — there is no identifier field. This differs from
+          incoming-payment and outgoing-payment grants, which are scoped to a
+          specific wallet address. Quote access is granted at the server level
+          because quotes are intermediate computation resources rather than
+          account-level financial operations.
+
+          This is a non-interactive grant. No interact field is included in the
+          request body, so the authorization server issues an access token
+          immediately without redirecting the user to an approval screen.
+
+          All requests to the authorization server must carry a valid HTTP
+          Message Signature (RFC 9421). The Arazzo runtime or SDK is
+          responsible for generating this signature before the request is sent.
+        operationId: auth-server.post-request
+        requestBody:
+          contentType: application/json
+          payload:
+            client: $inputs.clientWalletAddress
+            access_token:
+              access:
+                - type: quote
+                  actions:
+                    - create
+                    - read
+        successCriteria:
+          - condition: $statusCode == 200
+        outputs:
+          accessToken: $response.body#/access_token/value
+          continueUri: $response.body#/continue/uri
+
+      - stepId: create-quote
+        description: |-
+          Creates the quote resource on the payer's resource server using the
+          access token from step 2.
+
+          The request body requires walletAddress (the payer's wallet), receiver
+          (the incoming payment URL from Flow 1), and method (ilp — currently
+          the only supported payment method in Open Payments). The debitAmount
+          and receiveAmount fields are mutually exclusive optional additions
+          that control which end of the payment is fixed.
+
+          On success the payer's ASE resolves the ILP path to the receiver,
+          calculates the exchange rate, and returns a complete quote object.
+          The id field is the quote URL that must be passed to the outgoing
+          payment creation request in Flow 3. The expiresAt field indicates
+          how long this quote is valid — once it expires the client must
+          request a new quote before proceeding.
+
+          The create-quote response already contains the full quote object, so
+          no separate get-quote call is needed in this workflow. The read
+          capability of the quote grant is used in Flow 4, which documents
+          standalone resource read operations.
+        operationId: resource-server.create-quote
+        parameters:
+          - name: Authorization
+            in: header
+            value: "GNAP {$steps.request-grant.outputs.accessToken}"
+        requestBody:
+          contentType: application/json
+          payload:
+            walletAddress: $inputs.payerWalletAddress
+            receiver: $inputs.incomingPaymentUrl
+            method: ilp
+            debitAmount: $inputs.debitAmount
+            receiveAmount: $inputs.receiveAmount
+        successCriteria:
+          - condition: $statusCode == 201
+        outputs:
+          quoteId: $response.body#/id
+          debitAmount: $response.body#/debitAmount
+          receiveAmount: $response.body#/receiveAmount
+          expiresAt: $response.body#/expiresAt
+
+    outputs:
+      quoteId: $steps.create-quote.outputs.quoteId
+      debitAmount: $steps.create-quote.outputs.debitAmount
+      receiveAmount: $steps.create-quote.outputs.receiveAmount
+      expiresAt: $steps.create-quote.outputs.expiresAt
